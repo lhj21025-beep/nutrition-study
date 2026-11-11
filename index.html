@@ -18,6 +18,7 @@ button,.btn{font:inherit;border:1px solid var(--bd);background:var(--card);color
 textarea,input[type=text],input[type=password],input[type=number],select{width:100%;font:inherit;padding:9px;border-radius:10px;border:1px solid var(--bd);background:var(--bg);color:var(--tx)}
 textarea{min-height:110px}.sub{color:var(--sub);font-size:13px}.tag{font-size:12px;color:var(--sub)}
 .flip{min-height:200px;display:flex;align-items:center;justify-content:center;text-align:center;font-size:18px;cursor:pointer}
+.turn{animation:fl .4s ease}@keyframes fl{from{transform:rotateY(90deg);opacity:.2}to{transform:none;opacity:1}}
 .ok{color:var(--pri)}.no{color:var(--bad)}.chip{display:inline-block;padding:2px 8px;border-radius:99px;border:1px solid var(--bd);font-size:13px;margin:2px}
 #toast{position:fixed;left:12px;right:12px;bottom:18px;background:#222;color:#fff;padding:10px 14px;border-radius:10px;display:none;z-index:9;text-align:center}
 nav{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;position:sticky;bottom:0}
@@ -44,14 +45,14 @@ $('#gear').onclick=()=>go('set');
 // ---------- IndexedDB (자료) ----------
 const db=new Promise((ok,no)=>{const r=indexedDB.open('ntdb',1);r.onupgradeneeded=()=>r.result.createObjectStore('mat',{keyPath:'id'});r.onsuccess=()=>ok(r.result);r.onerror=()=>no(r.error)});
 const tx=async(m,f)=>{const d=await db;return new Promise((ok,no)=>{const t=d.transaction('mat',m),s=t.objectStore('mat'),r=f(s);t.oncomplete=()=>ok(r.result);t.onerror=()=>no(t.error)})};
-const mats=()=>tx('readonly',s=>s.getAll()),putMat=m=>tx('readwrite',s=>s.put(m)),delMat=id=>tx('readwrite',s=>s.delete(id));
+const getMat=id=>tx('readonly',s=>s.get(id)),mats=()=>tx('readonly',s=>s.getAll()),putMat=m=>tx('readwrite',s=>s.put(m)),delMat=id=>tx('readwrite',s=>s.delete(id));
 // ---------- Gemini ----------
-async function gem(parts,json=true){
+async function gem(parts,json=true,model){
   if(!S.key)throw new Error('⚙️ 설정에서 Gemini 키를 먼저 입력하세요');
   const wait=ms=>new Promise(z=>setTimeout(z,ms));
   for(let a=0;;a++){
     let r,j;
-    try{r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${S.model||DEF}:generateContent?key=${S.key}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contents:[{parts}],generationConfig:json?{responseMimeType:'application/json'}:{}})});j=await r.json()}
+    try{r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model||S.model||DEF}:generateContent?key=${S.key}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contents:[{parts}],generationConfig:json?{responseMimeType:'application/json'}:{}})});j=await r.json()}
     catch(e){if(a<3){await wait(2000*(a+1));continue}throw new Error('네트워크 오류: '+e.message)}
     if(!r.ok){const m=j.error?.message||String(r.status);if((r.status==429||r.status>=500)&&a<3&&!/credit|prepay|billing/i.test(m)){await wait(4000*(a+1));continue}throw new Error(m)}
     const t=(j.candidates?.[0]?.content?.parts||[]).map(p=>p.text||'').join('');
@@ -76,9 +77,17 @@ async function mic(btn,out){
 const speak=t=>{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.lang='ko-KR';speechSynthesis.speak(u)};
 // ---------- PDF/이미지 ----------
 pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+let TW;
+async function devOcr(imgs){
+  if(!window.Tesseract)await new Promise((ok,no)=>{const t=document.createElement('script');t.src='https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';t.onload=ok;t.onerror=()=>no(new Error('기기 OCR 엔진을 불러오지 못했어요 (인터넷 연결 확인)'));document.head.appendChild(t)});
+  TW=TW||await Tesseract.createWorker('kor+eng');
+  const out=[];for(const d of imgs){const r=await TW.recognize('data:image/jpeg;base64,'+d);out.push((r.data.text||'').replace(/[ \t]+\n/g,'\n').trim())}
+  return out;
+}
 async function ocr(imgs){
+  if(S.ocr=='device')return devOcr(imgs);
   const gs=[];for(let i=0;i<imgs.length;i+=4)gs.push(imgs.slice(i,i+4));
-  const one=async b=>{const r=await gem([{text:`이미지 ${b.length}장은 시험 공부 자료입니다. 각 이미지의 글자를 순서대로 그대로 옮겨 적어 길이 ${b.length}의 JSON 문자열 배열로만 답하세요.`},...b.map(d=>({inlineData:{mimeType:'image/jpeg',data:d}}))]);
+  const one=async b=>{const r=await gem([{text:`이미지 ${b.length}장은 시험 공부 자료입니다. 각 이미지의 글자를 순서대로 그대로 옮겨 적어 길이 ${b.length}의 JSON 문자열 배열로만 답하세요.`},...b.map(d=>({inlineData:{mimeType:'image/jpeg',data:d}}))],true,S.ocrModel||undefined);
     const arr=Array.isArray(r)?r:(Object.values(r||{}).find(Array.isArray)||[]);return b.map((_,k)=>String(arr[k]??''))};
   const out=[];
   for(let i=0;i<gs.length;i+=3)(await Promise.all(gs.slice(i,i+3).map(one))).forEach(x=>out.push(...x));
@@ -108,25 +117,28 @@ async function addPdf(f,report,range){
   };
   const pdf=await Promise.race([task.promise,cancel]);
   try{
-    const N=pdf.numPages,want=parseRange(range,N),todo=[];
-    for(let n=1;n<=N;n++)if(!want||want.has(n))todo.push(n);
-    const pages=Array(N).fill('');let buf=[],ns=0;
-    const flush=async fr=>{if(!buf.length)return;report(`🤖 AI가 스캔된 쪽을 글자로 인식 중 (스캔 ${ns}쪽째)`,fr);const r=await ocr(buf.map(b=>b[1]));buf.forEach((b,i)=>pages[b[0]]=r[i]);buf=[]};
+    const N=pdf.numPages,want=parseRange(range,N),id='pdf:'+f.name+':'+f.size,old=await getMat(id);
+    const ok=old&&old.pages&&old.pages.length==N;
+    const pages=ok?old.pages.slice():Array(N).fill(''),done=new Set(ok?old.done||[]:[]);
+    const todo=[];for(let n=1;n<=N;n++)if((!want||want.has(n))&&!done.has(n))todo.push(n);
+    const dev=S.ocr=='device',TH=dev?4:12;let buf=[],ns=0;
+    const meta=part=>({id,name:f.name,size:f.size,pages,done:[...done],partial:part});
+    const flush=async fr=>{if(!buf.length)return;report(`${dev?'🖥 폰에서':'🤖 AI가'} 스캔된 쪽을 글자로 인식 중 (스캔 ${ns}쪽째)`,fr);const r=await ocr(buf.map(b=>b[1]));buf.forEach((b,i)=>{pages[b[0]]=r[i];done.add(b[0]+1)});buf=[];await putMat(meta(true))};
     for(let k=0;k<todo.length;k++){
       const n=todo[k],fr=(k+1)/todo.length;
       report(`📖 ${n}쪽 읽는 중 (${k+1}/${todo.length})`,fr);
       const p=await pdf.getPage(n),t=(await p.getTextContent()).items.map(i=>i.str).join(' ').trim();
-      if(t.length>=30)pages[n-1]=t;else{
-        const vp=p.getViewport({scale:1.5}),c=document.createElement('canvas');c.width=vp.width;c.height=vp.height;
+      if(t.length>=30){pages[n-1]=t;done.add(n)}else{
+        const vp=p.getViewport({scale:dev?2:1.5}),c=document.createElement('canvas');c.width=vp.width;c.height=vp.height;
         await p.render({canvasContext:c.getContext('2d'),viewport:vp}).promise;
-        ns++;buf.push([n-1,c.toDataURL('image/jpeg',.7).split(',')[1]]);c.width=c.height=0;
-        if(buf.length>=12)await flush(fr);
+        ns++;buf.push([n-1,c.toDataURL('image/jpeg',.8).split(',')[1]]);c.width=c.height=0;
+        if(buf.length>=TH)await flush(fr);
       }
       p.cleanup();
     }
     await flush(1);
     report('💾 기기에 저장 중…',1);
-    await putMat({id:Date.now()+Math.random()+'',name:f.name,size:f.size,pages});
+    await putMat(meta(!!want&&todo.length>=0&&pages.some((t,i)=>!done.has(i+1))));
   }finally{pdf.destroy()}
 }
 function addFiles(fs){
@@ -141,7 +153,7 @@ function addFiles(fs){
   paint();
 }
 async function runUp(){
-  const q=UP.files.filter(x=>x.st=='wait');if(UP.busy||!q.length)return;
+  const q=UP.files.filter(x=>x.st=='wait'||x.st=='err'||x.st=='skip');if(UP.busy||!q.length)return;
   UP.busy=true;let ok=0,bad=0;
   for(let k=0;k<q.length;k++){
     const x=q[k];x.st='run';x.note='';
@@ -157,11 +169,11 @@ async function runUp(){
 function paint(){
   const b=$('#stbox');if(!b)return;
   if(!UP.files.length&&!UP.busy&&!UP.msg){b.innerHTML='';return}
-  const ic={wait:'🕓',run:'⏳',done:'✅',err:'❌',skip:'🔒'},w=UP.files.filter(x=>x.st=='wait').length;
+  const ic={wait:'🕓',run:'⏳',done:'✅',err:'❌',skip:'🔒'},w=UP.files.filter(x=>x.st=='wait'||x.st=='err'||x.st=='skip').length;
   b.innerHTML=`<div class="card" style="border:2px solid var(--pri)">
   ${UP.msg?`<div style="font-size:18px;font-weight:700">${UP.busy?'⏳ ':''}${esc(UP.msg)}</div><div style="margin:4px 0;word-break:break-all">${esc(UP.sub)}</div>`:''}
   ${UP.busy?`<div style="height:12px;border-radius:99px;background:var(--bd);overflow:hidden"><div style="height:100%;width:${UP.pct}%;background:var(--pri);transition:width .3s"></div></div><div class="sub" style="margin-top:4px">${UP.pct}% · 분석이 끝날 때까지 화면을 켜 두세요</div>`:''}
-  <div style="margin-top:8px">${UP.files.map((x,k)=>`<div class="row" style="flex-wrap:nowrap;margin:4px 0"><span style="flex:4;word-break:break-all">${ic[x.st]} ${esc(x.f.name)} <span class="sub">${(x.f.size/1048576).toFixed(1)}MB${x.note?' · '+esc(x.note):''}</span></span>${!UP.busy&&x.st!='done'?`<button data-rm="${k}" style="flex:0">✕</button>`:''}</div>${x.st=='wait'?`<input data-rg="${k}" type="text" value="${esc(x.range)}" placeholder="분석할 쪽 범위 (예: 1-50, 60 · 비우면 전체)" style="margin-bottom:6px">`:''}`).join('')}</div>
+  <div style="margin-top:8px">${UP.files.map((x,k)=>`<div class="row" style="flex-wrap:nowrap;margin:4px 0"><span style="flex:4;word-break:break-all">${ic[x.st]} ${esc(x.f.name)} <span class="sub">${(x.f.size/1048576).toFixed(1)}MB${x.note?' · '+esc(x.note):''}</span></span>${!UP.busy&&x.st!='done'?`<button data-rm="${k}" style="flex:0">✕</button>`:''}</div>${x.st!='done'&&x.st!='run'?`<input data-rg="${k}" type="text" value="${esc(x.range)}" placeholder="분석할 쪽 범위 (예: 1-50, 60 · 비우면 전체)" style="margin-bottom:6px">`:''}`).join('')}</div>
   ${!UP.busy&&w?`<button class="p" id="goup" style="width:100%;margin-top:8px">▶ 업로드·AI 분석 시작 (${w}개)</button>`:''}</div>`;
   b.querySelectorAll('[data-rm]').forEach(x=>x.onclick=()=>{UP.files.splice(+x.dataset.rm,1);paint()});
   b.querySelectorAll('[data-rg]').forEach(x=>x.oninput=()=>{UP.files[+x.dataset.rg].range=x.value});
@@ -198,7 +210,7 @@ async function home(){
   return `<div class="card"><b>학습 자료 올리기</b><p class="sub">PDF(1개당 50MB까지, 스캔본도 AI가 인식)와 사진은 이 기기에만 저장돼요.</p>
   <div class="row"><label class="btn p" style="text-align:center">📄 PDF 선택 (여러 개)<input id="pdf" type="file" accept="application/pdf" multiple hidden></label>
   <label class="btn" style="text-align:center">📷 사진 찍기<input id="img" type="file" accept="image/*" capture="environment" hidden></label></div></div><div id="stbox"></div>
-  <h2>내 자료 (${m.length})</h2>${m.map(x=>`<div class="card row"><div style="flex:3"><b>${esc(x.name)}</b><div class="sub">분석 ${x.pages.filter(Boolean).length}/${x.pages.length}쪽 · ${(x.size/1048576).toFixed(1)}MB</div></div><button data-del="${x.id}" style="flex:0">🗑</button></div>`).join('')||'<p class="sub">아직 자료가 없어요.</p>'}
+  <h2>내 자료 (${m.length})</h2>${m.map(x=>`<div class="card row"><div style="flex:3"><b>${esc(x.name)}</b><div class="sub">분석 ${x.pages.filter(Boolean).length}/${x.pages.length}쪽 · ${(x.size/1048576).toFixed(1)}MB</div>${x.partial?'<div class="no" style="font-size:13px">⏸ 일부만 분석됨 — 같은 파일을 다시 올리면 이어서 분석해요</div>':''}</div><button data-del="${x.id}" style="flex:0">🗑</button></div>`).join('')||'<p class="sub">아직 자료가 없어요.</p>'}
   <div class="row"><button class="p" data-go="mat">✨ 카드·문제 만들기</button></div>
   <div class="card">카드 ${S.cards.length}개 · 문제 ${S.qs.length}개 · 오답 ${S.notes.length}개<br><span class="sub">복습할 카드 ${hard}개</span></div>`;
 }
@@ -207,7 +219,7 @@ async function mat(){
   window.after=()=>{$('#gen').onclick=gen};
   return `<h2>자료 선택 (여러 개 가능)</h2><div class="card">${m.map(x=>`<label style="display:block"><input type="checkbox" class="sel" value="${x.id}"> ${esc(x.name)} <span class="sub">${x.pages.filter(Boolean).length}/${x.pages.length}쪽</span></label>`).join('')||'<span class="sub">홈에서 자료를 먼저 올려주세요.</span>'}</div>
   <div class="card"><div class="row"><div>종류<select id="kind"><option value="c">뒤집기 카드</option><option value="q">문제</option></select></div><div>개수<input id="n" type="number" min="1" max="50" value="10"></div></div>
-  <div style="margin-top:8px">유형<select id="ty"><option value="mix">암기 + 서술 (반반)</option><option value="mem">암기 위주</option><option value="ess">서술 위주</option></select></div>
+  <div style="margin-top:8px">유형 (문제만 해당)<select id="ty"><option value="mix">암기 + 서술 (반반)</option><option value="mem">암기 위주</option><option value="ess">서술 위주</option></select></div>
   <p class="sub">선택한 자료 안의 내용으로만 만들고, 각 항목에 파일명·쪽수를 표시해요.</p>
   <button class="p" id="gen" style="width:100%">만들기</button><div id="st" class="sub"></div></div>`;
 }
@@ -217,11 +229,11 @@ async function gen(){
   const n=Math.min(50,+$('#n').value||10),kind=$('#kind').value,ty=$('#ty').value;
   const all=(await mats()).filter(x=>ids.includes(x.id));
   let ctx=all.map(x=>x.pages.map((p,i)=>p?`[${x.name} p.${i+1}]\n${p}`:'').filter(Boolean).join('\n')).join('\n\n');if(ctx.length>400000){toast('자료가 길어 앞부분 일부만 사용했어요. 자료를 나눠 선택해 보세요');ctx=ctx.slice(0,400000)}
-  const tyT={mix:'암기형(용어·수치·기준)과 서술형을 절반씩',mem:'암기형(용어·수치·기준) 위주로',ess:'개념 설명·이유를 쓰는 서술형 위주로'}[ty];
-  const fmt=kind=='c'?'[{"q":"앞면(질문/용어)","a":"뒷면(답)","src":"파일명 p.쪽"}]':'[{"q":"문제","keywords":["채점 핵심 키워드"],"model":"모범 답안","src":"파일명 p.쪽"}]';
+  const tyX0=null;const tyT={mix:'암기형(용어·수치·기준)과 서술형을 절반씩',mem:'암기형(용어·수치·기준) 위주로',ess:'개념 설명·이유를 쓰는 서술형 위주로'}[ty];
+  const fmt=kind=='c'?'[{"q":"단답형 질문","a":"짧은 정답","alt":["인정할 다른 표현"],"exp":"한 줄 해설","src":"파일명 p.쪽"}]':'[{"q":"문제","keywords":["채점 핵심 키워드"],"model":"모범 답안","src":"파일명 p.쪽"}]';
   $('#st').textContent='AI가 만드는 중…';$('#gen').disabled=true;
   try{
-    const r=await gem([{text:`당신은 영양교사 임용시험 출제자입니다. 아래 자료에 있는 내용으로만 ${tyT} ${n}개의 ${kind=='c'?'플래시카드':'문제'}를 만드세요. 자료에 없는 내용은 절대 쓰지 마세요. JSON 배열로만 답하세요: ${fmt}\n\n자료:\n${ctx}`}]);
+    const r=await gem([{text:`당신은 영양교사 임용시험 출제자입니다. 아래 자료에 있는 내용으로만 ${kind=='c'?'한 단어·숫자·짧은 구로 답할 수 있는 단답형 질문만':tyT} ${n}개의 ${kind=='c'?'플래시카드':'문제'}를 만드세요. 자료에 없는 내용은 절대 쓰지 마세요. ${kind=='c'?'질문은 정답이 하나로 떨어지게 구체적으로 쓰고, 정답(a)은 20자 이내로 짧게 쓰세요. alt에는 같은 뜻으로 인정할 다른 표현(없으면 빈 배열), exp에는 자료에 근거한 한 줄 해설을 쓰세요. ':''}JSON 배열로만 답하세요: ${fmt}\n\n자료:\n${ctx}`}]);
     const list=Array.isArray(r)?r:(Object.values(r||{}).find(Array.isArray)||[]);
     const arr=list.filter(x=>x&&x.q&&(kind=='q'||x.a)).map((x,k)=>({...x,id:Date.now()+k+Math.random()}));
     if(!arr.length)throw new Error('AI가 항목을 만들지 못했어요. 다시 시도해 주세요');
@@ -242,18 +254,38 @@ async function cards(){
   }
   const i=cur.i,c=byId(cur.q[i]);
   if(!c){cur.i=i+1;return cards()}
+  const last=i+1>=cur.q.length,nm={no:'몰라요',mid:'헷갈려요',know:'알아요'};
   window.after=()=>{
-    $('#fl').onclick=()=>{cur.f=!cur.f;render()};
-    $('#mic').onclick=e=>mic(e.target,$('#ans'));
-    $('#sp').onclick=()=>speak(c.q);
-    $('#del').onclick=()=>{if(confirm('이 카드를 삭제할까요?')){S.cards=S.cards.filter(x=>x.id!=c.id);cur.q.splice(i,1);cur.f=0;save();render()}};
-    document.querySelectorAll('[data-st]').forEach(b=>b.onclick=()=>{c.st=b.dataset.st;save();cur.i=i+1;cur.f=0;render()});
+    $('#mic')&&($('#mic').onclick=e=>mic(e.target,$('#ans')));
+    $('#sp')&&($('#sp').onclick=()=>speak(c.q));
+    $('#del').onclick=()=>{if(confirm('이 카드를 삭제할까요?')){S.cards=S.cards.filter(x=>x.id!=c.id);cur.q.splice(i,1);cur.f=0;cur.r=null;save();render()}};
+    document.querySelectorAll('[data-st]').forEach(b=>b.onclick=()=>{
+      const u=$('#ans').value.trim();c.st=b.dataset.st;save();
+      cur.r=c.st;cur.ua=u;cur.g=cardGrade(u,c);cur.why='';cur.f=true;render();
+    });
+    $('#nx')&&($('#nx').onclick=()=>{cur.i=i+1;cur.f=0;cur.r=null;cur.ua='';cur.g=null;cur.why='';render()});
+    $('#rg')&&($('#rg').onclick=async()=>{
+      const bt=$('#rg');bt.disabled=true;bt.textContent='채점 중…';
+      try{const r=await gem([{text:`단답형 문제 채점입니다. 문제: ${c.q}\n정답: ${c.a}${(c.alt||[]).length?' (인정 표현: '+c.alt.join(', ')+')':''}\n학생 답: ${cur.ua}\n뜻이 같으면 정답으로 인정하세요. JSON 객체로만: {"ok":true 또는 false,"why":"한 줄 이유"}`}]);
+        const o=Array.isArray(r)?r[0]:r;cur.g=!!o.ok;cur.why=o.why||'';render();
+      }catch(e){toast(e.message);bt.disabled=false;bt.textContent='🤖 AI로 다시 채점'}
+    });
   };
-  return `<div class="row"><span class="sub">${i+1} / ${cur.q.length} · ${({new:'외울 카드',rev:'복습',all:'전체'})[cur.mode]}</span><button id="del" style="flex:0">🗑</button></div>
-  <div class="card flip" id="fl"><div>${cur.f?`<b class="ok">${esc(c.a)}</b>`:esc(c.q)}<div class="tag" style="margin-top:12px">${esc(c.src)} · 탭하면 뒤집혀요</div></div></div>
-  <textarea id="ans" placeholder="내 답 (말하면 글자로 표시돼요)" style="min-height:70px"></textarea>
+  const head=`<div class="row"><span class="sub">${i+1} / ${cur.q.length} · ${({new:'외울 카드',rev:'복습',all:'전체'})[cur.mode]}</span><button id="del" style="flex:0">🗑</button></div>`;
+  if(!cur.f)return head+`<div class="card flip"><div>${esc(c.q)}<div class="tag" style="margin-top:12px">${esc(c.src)}</div></div></div>
+  <textarea id="ans" placeholder="정답을 적거나 🎤로 말해 보세요 (비워도 돼요)" style="min-height:70px"></textarea>
   <div class="row" style="margin:8px 0"><button id="mic">🎤 말하기</button><button id="sp">🔊 읽어주기</button></div>
+  <p class="sub">얼마나 아는지 고르면 카드가 뒤집혀 정답이 나와요.</p>
   <div class="row"><button data-st="no" class="no">몰라요</button><button data-st="mid">헷갈려요</button><button data-st="know" class="ok">알아요</button></div>`;
+  const g=cur.g;
+  return head+`<div class="card flip turn"><div><div class="tag">${esc(c.q)}</div><div class="ok" style="font-size:24px;margin:10px 0"><b>${esc(c.a)}</b></div>${(c.alt||[]).length?`<div class="sub">인정: ${c.alt.map(esc).join(' / ')}</div>`:''}${c.exp?`<div class="sub" style="margin-top:6px">${esc(c.exp)}</div>`:''}<div class="tag" style="margin-top:10px">${esc(c.src)}</div></div></div>
+  <div class="card">내 표시: <b>${nm[cur.r]}</b>${cur.ua?`<br>내 답: ${esc(cur.ua)}<br>${g?'<b class="ok">⭕ 정답이에요</b>':'<b class="no">❌ 오답이에요</b>'}${cur.why?` <span class="sub">${esc(cur.why)}</span>`:''}${!g?`<div style="margin-top:6px"><button id="rg">🤖 AI로 다시 채점</button> <span class="sub">뜻이 같은데 오답으로 나왔다면 눌러 보세요</span></div>`:''}${g&&cur.r!='know'?'':''}${!g&&cur.r=='know'?'<div class="sub" style="margin-top:4px">알아요로 표시했지만 오답이에요. 다음에 복습해 보세요.</div>':''}`:'<br><span class="sub">답을 입력하지 않아 채점은 하지 않았어요.</span>'}</div>
+  <button class="p" id="nx" style="width:100%">${last?'결과 보기':'다음 ›'}</button>`;
+}
+const nrm=t=>String(t||'').toLowerCase().replace(/[^0-9a-z가-힣]/g,'');
+function cardGrade(u,c){
+  const U=nrm(u);if(!U)return null;
+  return [c.a,...(c.alt||[])].map(nrm).filter(Boolean).some(x=>U==x||(x.length>=2&&U.includes(x))||(U.length>=2&&x.includes(U)&&U.length/x.length>=.6));
 }
 function saveNote(r){if(r.saved)return;r.saved=1;S.notes.push({q:r.q,a:r.a,model:r.model,miss:r.fb.miss,src:r.src,t:Date.now()});save()}
 async function quiz(){
@@ -317,11 +349,14 @@ async function set(){
   window.after=()=>{
     $('#k').onchange=e=>{S.key=e.target.value.trim();save();toast('저장했어요')};
     $('#md').onchange=e=>{S.model=e.target.value.trim();save();toast('저장했어요')};
+    $('#oc').onchange=e=>{S.ocr=e.target.value;save();toast('저장했어요')};
+    $('#om').onchange=e=>{S.ocrModel=e.target.value.trim();save();toast('저장했어요')};
     $('#ex').onclick=async()=>{const d={S:{...S,key:''},mats:await mats()};const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(d)],{type:'application/json'}));a.download='nutrition-backup.json';a.click()};
     $('#im').onchange=async e=>{try{const d=JSON.parse(await e.target.files[0].text());const k=S.key;S={...S,...d.S,key:k};save();for(const m of d.mats)await putMat(m);toast('가져왔어요');go('home')}catch(x){toast('백업 파일을 읽지 못했어요')}};
   };
   return `<h2>설정</h2><div class="card"><b>Gemini API 키</b><p class="sub">이 기기에만 저장되고 코드에는 들어가지 않아요.</p><input id="k" type="password" value="${esc(S.key)}" placeholder="AIza..."></div>
   <div class="card"><b>AI 모델</b><p class="sub">기본값은 ${DEF}예요. 오류가 나면 gemini-3.5-flash로 바꿔 보세요.</p><input id="md" type="text" value="${esc(S.model||DEF)}"></div>
+  <div class="card"><b>스캔본·사진 글자 인식 방식</b><select id="oc" style="margin:6px 0"><option value="gemini">Gemini AI (정확 · 크레딧 사용)</option><option value="device" ${S.ocr=='device'?'selected':''}>내 폰에서 (무료 · 느림 · 정확도 낮음 · 실험)</option></select><p class="sub">Gemini 방식에서 인식용 모델을 따로 쓰려면 아래에 입력하세요. 비우면 위 AI 모델을 써요.</p><input id="om" type="text" value="${esc(S.ocrModel||'')}" placeholder="인식용 모델 (선택)"></div>
   <div class="card"><b>백업</b><p class="sub">폰을 바꾸거나 브라우저 데이터를 지우면 사라지니 가끔 내보내세요.</p><div class="row"><button id="ex">내보내기</button><label class="btn" style="text-align:center">가져오기<input id="im" type="file" accept="application/json" hidden></label></div></div>
   <button onclick="go('home')" class="p" style="width:100%">← 돌아가기</button>`;
 }
