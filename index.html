@@ -37,7 +37,7 @@ let S={cards:[],qs:[],notes:[],key:'',theme:''};
 try{Object.assign(S,JSON.parse(localStorage.nt||'{}'))}catch(e){}
 const save=()=>{try{localStorage.nt=JSON.stringify(S)}catch(e){toast('저장 공간이 부족합니다')}};
 const toast=m=>{const t=$('#toast');t.textContent=m;t.style.display='block';clearTimeout(toast.h);toast.h=setTimeout(()=>t.style.display='none',3500)};
-const MODEL='gemini-2.5-flash',MAX=50*1024*1024;
+const MAX=50*1024*1024,DEF='gemini-3.6-flash';
 function theme(){document.documentElement.dataset.theme=S.theme||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light')}
 theme();$('#tg').onclick=()=>{S.theme=document.documentElement.dataset.theme=='dark'?'light':'dark';save();theme()};
 $('#gear').onclick=()=>go('set');
@@ -48,7 +48,7 @@ const mats=()=>tx('readonly',s=>s.getAll()),putMat=m=>tx('readwrite',s=>s.put(m)
 // ---------- Gemini ----------
 async function gem(parts,json=true){
   if(!S.key)throw new Error('⚙️ 설정에서 Gemini 키를 먼저 입력하세요');
-  const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${S.key}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contents:[{parts}],generationConfig:json?{responseMimeType:'application/json'}:{}})});
+  const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${S.model||DEF}:generateContent?key=${S.key}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contents:[{parts}],generationConfig:json?{responseMimeType:'application/json'}:{}})});
   const j=await r.json();if(!r.ok)throw new Error(j.error?.message||r.status);
   const t=(j.candidates?.[0]?.content?.parts||[]).map(p=>p.text||'').join('');
   return json?JSON.parse(t.replace(/^```json|```$/g,'')):t;
@@ -199,10 +199,12 @@ async function notes(){
 async function set(){
   window.after=()=>{
     $('#k').onchange=e=>{S.key=e.target.value.trim();save();toast('저장했어요')};
+    $('#md').onchange=e=>{S.model=e.target.value.trim();save();toast('저장했어요')};
     $('#ex').onclick=async()=>{const d={S:{...S,key:''},mats:await mats()};const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(d)],{type:'application/json'}));a.download='nutrition-backup.json';a.click()};
     $('#im').onchange=async e=>{try{const d=JSON.parse(await e.target.files[0].text());const k=S.key;S={...S,...d.S,key:k};save();for(const m of d.mats)await putMat(m);toast('가져왔어요');go('home')}catch(x){toast('백업 파일을 읽지 못했어요')}};
   };
   return `<h2>설정</h2><div class="card"><b>Gemini API 키</b><p class="sub">이 기기에만 저장되고 코드에는 들어가지 않아요.</p><input id="k" type="password" value="${esc(S.key)}" placeholder="AIza..."></div>
+  <div class="card"><b>AI 모델</b><p class="sub">기본값은 ${DEF}예요. 오류가 나면 gemini-3.5-flash로 바꿔 보세요.</p><input id="md" type="text" value="${esc(S.model||DEF)}"></div>
   <div class="card"><b>백업</b><p class="sub">폰을 바꾸거나 브라우저 데이터를 지우면 사라지니 가끔 내보내세요.</p><div class="row"><button id="ex">내보내기</button><label class="btn" style="text-align:center">가져오기<input id="im" type="file" accept="application/json" hidden></label></div></div>
   <button onclick="go('home')" class="p" style="width:100%">← 돌아가기</button>`;
 }
