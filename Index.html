@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#2f7d5b">
+<title>영양교사 학습앱</title>
+<style>
+:root{--bg:#f6f7f4;--card:#fff;--tx:#1d2420;--sub:#68736c;--pri:#2f7d5b;--bd:#dfe5df;--bad:#c0463a;--mid:#c58a1b}
+:root[data-theme=dark]{--bg:#121714;--card:#1c231f;--tx:#e8eee9;--sub:#98a59c;--pri:#4fb58a;--bd:#2c372f;--bad:#e2685c;--mid:#e0aa45}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.5 system-ui,sans-serif;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+main{max-width:520px;margin:0 auto;padding:14px}
+header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+h1{font-size:20px;margin:0}h2{font-size:17px;margin:14px 0 6px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:14px;margin:10px 0}
+button,.btn{font:inherit;border:1px solid var(--bd);background:var(--card);color:var(--tx);border-radius:10px;padding:9px 13px;cursor:pointer}
+.p{background:var(--pri);color:#fff;border-color:var(--pri)}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.row>*{flex:1}
+textarea,input[type=text],input[type=password],input[type=number],select{width:100%;font:inherit;padding:9px;border-radius:10px;border:1px solid var(--bd);background:var(--bg);color:var(--tx)}
+textarea{min-height:110px}.sub{color:var(--sub);font-size:13px}.tag{font-size:12px;color:var(--sub)}
+.flip{min-height:200px;display:flex;align-items:center;justify-content:center;text-align:center;font-size:18px;cursor:pointer}
+.ok{color:var(--pri)}.no{color:var(--bad)}.chip{display:inline-block;padding:2px 8px;border-radius:99px;border:1px solid var(--bd);font-size:13px;margin:2px}
+#toast{position:fixed;left:12px;right:12px;bottom:18px;background:#222;color:#fff;padding:10px 14px;border-radius:10px;display:none;z-index:9;text-align:center}
+nav{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;position:sticky;bottom:0}
+</style>
+</head>
+<body>
+<main>
+<header><h1>🥗 영양교사 학습앱</h1><div class="row" style="flex:0"><button id="tg">🌓</button><button id="gear">⚙️</button></div></header>
+<div id="v"></div>
+</main>
+<div id="toast"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+"use strict";
+const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let S={cards:[],qs:[],notes:[],key:'',theme:''};
+try{Object.assign(S,JSON.parse(localStorage.nt||'{}'))}catch(e){}
+const save=()=>{try{localStorage.nt=JSON.stringify(S)}catch(e){toast('저장 공간이 부족합니다')}};
+const toast=m=>{const t=$('#toast');t.textContent=m;t.style.display='block';clearTimeout(toast.h);toast.h=setTimeout(()=>t.style.display='none',3500)};
+const MODEL='gemini-2.5-flash',MAX=50*1024*1024;
+function theme(){document.documentElement.dataset.theme=S.theme||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light')}
+theme();$('#tg').onclick=()=>{S.theme=document.documentElement.dataset.theme=='dark'?'light':'dark';save();theme()};
+$('#gear').onclick=()=>go('set');
+// ---------- IndexedDB (자료) ----------
+const db=new Promise((ok,no)=>{const r=indexedDB.open('ntdb',1);r.onupgradeneeded=()=>r.result.createObjectStore('mat',{keyPath:'id'});r.onsuccess=()=>ok(r.result);r.onerror=()=>no(r.error)});
+const tx=async(m,f)=>{const d=await db;return new Promise((ok,no)=>{const t=d.transaction('mat',m),s=t.objectStore('mat'),r=f(s);t.oncomplete=()=>ok(r.result);t.onerror=()=>no(t.error)})};
+const mats=()=>tx('readonly',s=>s.getAll()),putMat=m=>tx('readwrite',s=>s.put(m)),delMat=id=>tx('readwrite',s=>s.delete(id));
+// ---------- Gemini ----------
+async function gem(parts,json=true){
+  if(!S.key)throw new Error('⚙️ 설정에서 Gemini 키를 먼저 입력하세요');
+  const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${S.key}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contents:[{parts}],generationConfig:json?{responseMimeType:'application/json'}:{}})});
+  const j=await r.json();if(!r.ok)throw new Error(j.error?.message||r.status);
+  const t=(j.candidates?.[0]?.content?.parts||[]).map(p=>p.text||'').join('');
+  return json?JSON.parse(t.replace(/^```json|```$/g,'')):t;
+}
+const b64=b=>new Promise(ok=>{const f=new FileReader();f.onload=()=>ok(f.result.split(',')[1]);f.readAsDataURL(b)});
+// ---------- 음성(Gemini 받아쓰기) ----------
+let rec,chunks;
+async function mic(btn,out){
+  if(rec&&rec.state=='recording'){rec.stop();return}
+  try{const st=await navigator.mediaDevices.getUserMedia({audio:true});rec=new MediaRecorder(st);chunks=[];
+    rec.ondataavailable=e=>chunks.push(e.data);
+    rec.onstop=async()=>{st.getTracks().forEach(t=>t.stop());btn.textContent='⏳ 변환 중…';
+      try{const mt=(rec.mimeType||'audio/webm').split(';')[0];
+        const t=await gem([{text:'다음 한국어 음성을 들리는 그대로 받아쓰세요. 영양·급식·식품위생 전문용어(HACCP, 한계기준 등)는 정확히 적고, 받아쓴 텍스트만 출력하세요.'},{inlineData:{mimeType:mt,data:await b64(new Blob(chunks,{type:mt}))}}],false);
+        out.value=(out.value?out.value+' ':'')+t.trim()}catch(e){toast(e.message)}
+      btn.textContent='🎤 말하기'};
+    rec.start();btn.textContent='⏹ 멈추기'}catch(e){toast('마이크를 사용할 수 없습니다: '+e.message)}
+}
+const speak=t=>{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.lang='ko-KR';speechSynthesis.speak(u)};
+// ---------- PDF/이미지 ----------
+pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+async function ocr(imgs){ // imgs: base64 jpeg[]
+  const out=[];
+  for(let i=0;i<imgs.length;i+=4){
+    const b=imgs.slice(i,i+4);
+    const r=await gem([{text:`이미지 ${b.length}장은 시험 공부 자료입니다. 각 이미지의 글자를 순서대로 그대로 옮겨 적어 길이 ${b.length}의 JSON 문자열 배열로만 답하세요.`},...b.map(d=>({inlineData:{mimeType:'image/jpeg',data:d}}))]);
+    b.forEach((_,k)=>out.push(String(r[k]||'')));
+  }
+  return out;
+}
+async function addPdf(f){
+  if(f.size>MAX)return toast('PDF 1개당 50MB까지 가능합니다');
+  const prog=$('#prog');const say=t=>prog&&(prog.textContent=t);
+  const pdf=await pdfjsLib.getDocument({data:await f.arrayBuffer()}).promise;
+  const pages=[],scan=[];
+  for(let n=1;n<=pdf.numPages;n++){
+    say(`읽는 중 ${n}/${pdf.numPages}쪽`);
+    const p=await pdf.getPage(n),t=(await p.getTextContent()).items.map(i=>i.str).join(' ').trim();
+    if(t.length>=30)pages.push(t);else{
+      const vp=p.getViewport({scale:1.5}),c=document.createElement('canvas');c.width=vp.width;c.height=vp.height;
+      await p.render({canvasContext:c.getContext('2d'),viewport:vp}).promise;
+      pages.push('');scan.push([n-1,c.toDataURL('image/jpeg',.7).split(',')[1]]);
+    }
+  }
+  if(scan.length){say(`스캔된 ${scan.length}쪽을 AI로 인식 중…`);const r=await ocr(scan.map(s=>s[1]));scan.forEach((s,i)=>pages[s[0]]=r[i])}
+  await putMat({id:Date.now()+'',name:f.name,size:f.size,pages});
+}
+async function addImg(f){
+  $('#prog').textContent='사진 인식 중…';
+  const [t]=await ocr([await b64(f)]);
+  await putMat({id:Date.now()+'',name:'사진 '+new Date().toLocaleString('ko-KR'),size:f.size,pages:[t]});
+}
+// ---------- 화면 ----------
+let view='home',cur={};
+function go(v,x){view=v;cur=x||{};render()}
+const bar=()=>`<nav class="card" style="padding:8px">${[['home','🏠','홈'],['cards','🗂','카드'],['quiz','✍️','문제'],['notes','📒','오답']].map(a=>`<button data-go="${a[0]}">${a[1]}<br><span class="sub">${a[2]}</span></button>`).join('')}</nav>`;
+async function render(){
+  const v=$('#v');
+  const H={home,mat,cards,quiz,notes,set}[view];
+  v.innerHTML=await H()+(view=='set'?'':bar());
+  v.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));
+  window.after&&window.after();window.after=null;
+}
+async function home(){
+  const m=await mats(),hard=S.cards.filter(c=>c.st&&c.st!='know').length;
+  window.after=()=>{
+    $('#pdf').onchange=async e=>{for(const f of e.target.files){try{await addPdf(f)}catch(x){toast(f.name+': '+x.message)}}go('home')};
+    $('#img').onchange=async e=>{try{await addImg(e.target.files[0])}catch(x){toast(x.message)}go('home')};
+    document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{if(confirm('삭제할까요?')){await delMat(b.dataset.del);go('home')}});
+  };
+  return `<div class="card"><b>학습 자료 올리기</b><p class="sub">PDF(1개당 50MB까지, 스캔본도 AI가 인식)와 사진은 이 기기에만 저장돼요.</p>
+  <div class="row"><label class="btn p" style="text-align:center">📄 PDF 선택<input id="pdf" type="file" accept="application/pdf" multiple hidden></label>
+  <label class="btn" style="text-align:center">📷 사진 찍기<input id="img" type="file" accept="image/*" capture="environment" hidden></label></div><div id="prog" class="sub"></div></div>
+  <h2>내 자료 (${m.length})</h2>${m.map(x=>`<div class="card row"><div style="flex:3"><b>${esc(x.name)}</b><div class="sub">${x.pages.length}쪽 · ${(x.size/1048576).toFixed(1)}MB</div></div><button data-del="${x.id}" style="flex:0">🗑</button></div>`).join('')||'<p class="sub">아직 자료가 없어요.</p>'}
+  <div class="row"><button class="p" data-go="mat">✨ 카드·문제 만들기</button></div>
+  <div class="card">카드 ${S.cards.length}개 · 문제 ${S.qs.length}개 · 오답 ${S.notes.length}개<br><span class="sub">복습할 카드 ${hard}개</span></div>`;
+}
+async function mat(){
+  const m=await mats();
+  window.after=()=>{$('#gen').onclick=gen};
+  return `<h2>자료 선택 (여러 개 가능)</h2><div class="card">${m.map(x=>`<label style="display:block"><input type="checkbox" class="sel" value="${x.id}"> ${esc(x.name)} <span class="sub">${x.pages.length}쪽</span></label>`).join('')||'<span class="sub">홈에서 자료를 먼저 올려주세요.</span>'}</div>
+  <div class="card"><div class="row"><div>종류<select id="kind"><option value="c">뒤집기 카드</option><option value="q">문제</option></select></div><div>개수<input id="n" type="number" min="1" max="50" value="10"></div></div>
+  <div style="margin-top:8px">유형<select id="ty"><option value="mix">암기 + 서술 (반반)</option><option value="mem">암기 위주</option><option value="ess">서술 위주</option></select></div>
+  <p class="sub">선택한 자료 안의 내용으로만 만들고, 각 항목에 파일명·쪽수를 표시해요.</p>
+  <button class="p" id="gen" style="width:100%">만들기</button><div id="st" class="sub"></div></div>`;
+}
+async function gen(){
+  const ids=[...document.querySelectorAll('.sel:checked')].map(x=>x.value);
+  if(!ids.length)return toast('자료를 하나 이상 선택하세요');
+  const n=Math.min(50,+$('#n').value||10),kind=$('#kind').value,ty=$('#ty').value;
+  const all=(await mats()).filter(x=>ids.includes(x.id));
+  let ctx=all.map(x=>x.pages.map((p,i)=>`[${x.name} p.${i+1}]\n${p}`).join('\n')).join('\n\n').slice(0,400000);
+  const tyT={mix:'암기형(용어·수치·기준)과 서술형을 절반씩',mem:'암기형(용어·수치·기준) 위주로',ess:'개념 설명·이유를 쓰는 서술형 위주로'}[ty];
+  const fmt=kind=='c'?'[{"q":"앞면(질문/용어)","a":"뒷면(답)","src":"파일명 p.쪽"}]':'[{"q":"문제","keywords":["채점 핵심 키워드"],"model":"모범 답안","src":"파일명 p.쪽"}]';
+  $('#st').textContent='AI가 만드는 중…';$('#gen').disabled=true;
+  try{
+    const r=await gem([{text:`당신은 영양교사 임용시험 출제자입니다. 아래 자료에 있는 내용으로만 ${tyT} ${n}개의 ${kind=='c'?'플래시카드':'문제'}를 만드세요. 자료에 없는 내용은 절대 쓰지 마세요. JSON 배열로만 답하세요: ${fmt}\n\n자료:\n${ctx}`}]);
+    const arr=(Array.isArray(r)?r:[]).map(x=>({...x,id:Date.now()+Math.random()}));
+    if(kind=='c')S.cards.push(...arr);else S.qs.push(...arr);save();
+    toast(arr.length+'개 만들었어요');go(kind=='c'?'cards':'quiz');
+  }catch(e){toast(e.message);$('#st').textContent='';$('#gen').disabled=false}
+}
+async function cards(){
+  const pool=cur.rev?S.cards.filter(c=>c.st&&c.st!='know'):S.cards;
+  if(!pool.length)return `<div class="card">${cur.rev?'복습할 카드가 없어요.':'카드가 없어요. 먼저 만들어 주세요.'}</div><button class="p" data-go="mat">카드 만들기</button>`;
+  const i=(cur.i||0)%pool.length,c=pool[i];
+  window.after=()=>{
+    $('#fl').onclick=()=>{cur.f=!cur.f;render()};
+    $('#mic').onclick=e=>mic(e.target,$('#ans'));
+    $('#rv').onclick=()=>{cur.rev=!cur.rev;cur.i=0;cur.f=0;render()};
+    $('#del').onclick=()=>{if(confirm('이 카드를 삭제할까요?')){S.cards=S.cards.filter(x=>x.id!=c.id);save();cur.f=0;render()}};
+    document.querySelectorAll('[data-st]').forEach(b=>b.onclick=()=>{c.st=b.dataset.st;save();cur.i=i+1;cur.f=0;render()});
+  };
+  return `<div class="row"><span class="sub">${i+1} / ${pool.length}</span><button id="rv" style="flex:0">${cur.rev?'전체':'🔁 복습만'}</button><button id="del" style="flex:0">🗑</button></div>
+  <div class="card flip" id="fl"><div>${cur.f?`<b class="ok">${esc(c.a)}</b>`:esc(c.q)}<div class="tag" style="margin-top:12px">${esc(c.src)} · 탭하면 뒤집혀요</div></div></div>
+  <textarea id="ans" placeholder="내 답 (말하면 글자로 표시돼요)" style="min-height:70px"></textarea>
+  <div class="row" style="margin:8px 0"><button id="mic">🎤 말하기</button><button onclick="speak(${JSON.stringify(c.q).replace(/"/g,'&quot;')})">🔊 읽어주기</button></div>
+  <div class="row"><button data-st="no" class="no">몰라요</button><button data-st="mid">헷갈려요</button><button data-st="know" class="ok">알아요</button></div>`;
+}
+async function quiz(){
+  if(!S.qs.length)return `<div class="card">문제가 없어요. 먼저 만들어 주세요.</div><button class="p" data-go="mat">문제 만들기</button>`;
+  const i=(cur.i||0)%S.qs.length,q=S.qs[i];
+  window.after=()=>{
+    $('#mic').onclick=e=>mic(e.target,$('#ans'));
+    $('#nx')&&($('#nx').onclick=()=>go('quiz',{i:i+1}));
+    $('#del').onclick=()=>{if(confirm('이 문제를 삭제할까요?')){S.qs.splice(i,1);save();go('quiz',{i:0})}};
+    $('#sub').onclick=async()=>{
+      const a=$('#ans').value.trim();if(!a)return toast('답안을 입력하세요');
+      $('#sub').disabled=true;$('#sub').textContent='채점 중…';
+      try{const f=await gem([{text:`영양교사 시험 채점관으로서 답안을 채점하세요. 문제: ${q.q}\n핵심 키워드: ${(q.keywords||[]).join(', ')}\n모범 답안: ${q.model}\n학생 답안: ${a}\n한국어 JSON으로만: {"score":0~100,"hit":["포함된 키워드"],"miss":["빠진 키워드·한계기준 등"],"good":"잘한 점","improve":"보완할 점"}`}]);
+        cur.fb=f;cur.a=a;render();
+      }catch(e){toast(e.message);$('#sub').disabled=false;$('#sub').textContent='제출'}
+    };
+    if($('#sv'))$('#sv').onclick=()=>{S.notes.push({q:q.q,a:cur.a,model:q.model,miss:cur.fb.miss,src:q.src,t:Date.now()});save();toast('오답노트에 저장했어요');$('#sv').disabled=true};
+  };
+  const f=cur.fb;
+  return `<div class="row"><span class="sub">${i+1} / ${S.qs.length}</span><button id="del" style="flex:0">🗑</button></div>
+  <div class="card"><b>${esc(q.q)}</b><div class="tag">${esc(q.src)}</div><button onclick="speak(${JSON.stringify(q.q).replace(/"/g,'&quot;')})" style="margin-top:8px">🔊 문제 읽기</button></div>
+  <textarea id="ans" placeholder="답안 (🎤로 말하면 인식된 글자가 여기에 표시돼요)">${esc(cur.a||'')}</textarea>
+  <div class="row" style="margin:8px 0"><button id="mic">🎤 말하기</button><button class="p" id="sub">제출</button></div>
+  ${f?`<div class="card"><b>${f.score}점</b><p>✅ ${(f.hit||[]).map(k=>`<span class="chip">${esc(k)}</span>`).join('')||'-'}</p><p>❌ ${(f.miss||[]).map(k=>`<span class="chip no">${esc(k)}</span>`).join('')||'-'}</p><p><b>잘한 점</b> ${esc(f.good)}</p><p><b>보완할 점</b> ${esc(f.improve)}</p><p><b>모범 답안</b><br>${esc(q.model)}</p>
+  <div class="row"><button id="sv">📒 오답노트 저장</button><button id="nx" class="p">다음 문제</button></div></div>`:''}`;
+}
+async function notes(){
+  window.after=()=>document.querySelectorAll('[data-nd]').forEach(b=>b.onclick=()=>{S.notes.splice(+b.dataset.nd,1);save();render()});
+  return `<h2>오답노트 (${S.notes.length})</h2>`+(S.notes.map((n,i)=>`<div class="card"><b>${esc(n.q)}</b><div class="tag">${esc(n.src)}</div><p><b>내 답</b> ${esc(n.a)}</p><p class="no">빠진 것: ${(n.miss||[]).map(esc).join(', ')||'-'}</p><p class="ok"><b>모범 답안</b> ${esc(n.model)}</p><button data-nd="${i}">삭제</button></div>`).join('')||'<p class="sub">저장된 오답이 없어요.</p>');
+}
+async function set(){
+  window.after=()=>{
+    $('#k').onchange=e=>{S.key=e.target.value.trim();save();toast('저장했어요')};
+    $('#ex').onclick=async()=>{const d={S:{...S,key:''},mats:await mats()};const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(d)],{type:'application/json'}));a.download='nutrition-backup.json';a.click()};
+    $('#im').onchange=async e=>{try{const d=JSON.parse(await e.target.files[0].text());const k=S.key;S={...S,...d.S,key:k};save();for(const m of d.mats)await putMat(m);toast('가져왔어요');go('home')}catch(x){toast('백업 파일을 읽지 못했어요')}};
+  };
+  return `<h2>설정</h2><div class="card"><b>Gemini API 키</b><p class="sub">이 기기에만 저장되고 코드에는 들어가지 않아요.</p><input id="k" type="password" value="${esc(S.key)}" placeholder="AIza..."></div>
+  <div class="card"><b>백업</b><p class="sub">폰을 바꾸거나 브라우저 데이터를 지우면 사라지니 가끔 내보내세요.</p><div class="row"><button id="ex">내보내기</button><label class="btn" style="text-align:center">가져오기<input id="im" type="file" accept="application/json" hidden></label></div></div>
+  <button onclick="go('home')" class="p" style="width:100%">← 돌아가기</button>`;
+}
+render();
+</script>
+</body>
+</html>
