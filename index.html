@@ -79,27 +79,88 @@ async function ocr(imgs){ // imgs: base64 jpeg[]
   }
   return out;
 }
-async function addPdf(f){
-  if(f.size>MAX)return toast('PDF 1개당 50MB까지 가능합니다');
-  const prog=$('#prog');const say=t=>prog&&(prog.textContent=t);
-  const pdf=await pdfjsLib.getDocument({data:await f.arrayBuffer()}).promise;
-  const pages=[],scan=[];
-  for(let n=1;n<=pdf.numPages;n++){
-    say(`읽는 중 ${n}/${pdf.numPages}쪽`);
-    const p=await pdf.getPage(n),t=(await p.getTextContent()).items.map(i=>i.str).join(' ').trim();
-    if(t.length>=30)pages.push(t);else{
-      const vp=p.getViewport({scale:1.5}),c=document.createElement('canvas');c.width=vp.width;c.height=vp.height;
-      await p.render({canvasContext:c.getContext('2d'),viewport:vp}).promise;
-      pages.push('');scan.push([n-1,c.toDataURL('image/jpeg',.7).split(',')[1]]);
+const UP={files:[],busy:false,msg:'',sub:'',pct:0};
+addEventListener('beforeunload',e=>{if(UP.busy){e.preventDefault();e.returnValue=''}});
+function askPw(name,wrong){return new Promise(ok=>{
+  const d=document.createElement('div');d.style.cssText='position:fixed;inset:0;background:#0008;display:flex;align-items:center;justify-content:center;z-index:20;padding:20px';
+  d.innerHTML=`<div class="card" style="width:100%;max-width:380px"><b>🔒 비밀번호가 필요해요</b><p class="sub" style="word-break:break-all">${esc(name)}</p>${wrong?'<p class="no">비밀번호가 맞지 않아요. 다시 입력해 주세요.</p>':''}<input id="pw" type="password" autocomplete="off" placeholder="PDF 비밀번호"><div class="row" style="margin-top:10px"><button id="pwn">건너뛰기</button><button id="pwy" class="p">확인</button></div></div>`;
+  document.body.appendChild(d);const i=d.querySelector('#pw');i.focus();
+  const end=v=>{d.remove();ok(v)};
+  d.querySelector('#pwy').onclick=()=>end(i.value);d.querySelector('#pwn').onclick=()=>end(null);
+  i.onkeydown=e=>{if(e.key=='Enter')end(i.value)};
+})}
+async function addPdf(f,report){
+  const task=pdfjsLib.getDocument({data:await f.arrayBuffer()});
+  let cancelFn;const cancel=new Promise((_,no)=>cancelFn=no);
+  task.onPassword=async(update,reason)=>{
+    const pw=await askPw(f.name,reason==2);
+    if(pw==null){cancelFn(new Error('비밀번호 입력을 건너뛰었어요'));task.destroy()}else update(pw);
+  };
+  const pdf=await Promise.race([task.promise,cancel]);
+  try{
+    const N=pdf.numPages,pages=[];let buf=[],ns=0;
+    const flush=async fr=>{if(!buf.length)return;report(`🤖 AI가 스캔된 쪽을 글자로 인식 중 (스캔 ${ns}쪽째)`,fr);const r=await ocr(buf.map(b=>b[1]));buf.forEach((b,i)=>pages[b[0]]=r[i]);buf=[]};
+    for(let n=1;n<=N;n++){
+      report(`📖 글자 읽는 중 ${n}/${N}쪽`,n/N);
+      const p=await pdf.getPage(n),t=(await p.getTextContent()).items.map(i=>i.str).join(' ').trim();
+      if(t.length>=30)pages[n-1]=t;else{
+        const vp=p.getViewport({scale:1.5}),c=document.createElement('canvas');c.width=vp.width;c.height=vp.height;
+        await p.render({canvasContext:c.getContext('2d'),viewport:vp}).promise;
+        pages[n-1]='';ns++;buf.push([n-1,c.toDataURL('image/jpeg',.7).split(',')[1]]);c.width=c.height=0;
+        if(buf.length>=4)await flush(n/N);
+      }
+      p.cleanup();
     }
+    await flush(1);
+    report('💾 기기에 저장 중…',1);
+    await putMat({id:Date.now()+Math.random()+'',name:f.name,size:f.size,pages});
+  }finally{pdf.destroy()}
+}
+function addFiles(fs){
+  UP.files=UP.files.filter(x=>x.st!='done');
+  for(const f of fs){
+    if(!/pdf$/i.test(f.type)&&!/\.pdf$/i.test(f.name))continue;
+    if(f.size>MAX){toast(f.name+': 50MB를 넘어서 제외했어요');continue}
+    if(UP.files.some(x=>x.f.name==f.name&&x.f.size==f.size))continue;
+    UP.files.push({f,st:'wait',note:''});
   }
-  if(scan.length){say(`스캔된 ${scan.length}쪽을 AI로 인식 중…`);const r=await ocr(scan.map(s=>s[1]));scan.forEach((s,i)=>pages[s[0]]=r[i])}
-  await putMat({id:Date.now()+'',name:f.name,size:f.size,pages});
+  if(!UP.busy){UP.msg='';UP.sub=''}
+  paint();
+}
+async function runUp(){
+  const q=UP.files.filter(x=>x.st=='wait');if(UP.busy||!q.length)return;
+  UP.busy=true;let ok=0,bad=0;
+  for(let k=0;k<q.length;k++){
+    const x=q[k];x.st='run';x.note='';
+    const base=k/q.length,span=1/q.length;
+    UP.msg=`파일 ${k+1}/${q.length} 분석 중`;UP.sub=x.f.name;UP.pct=Math.round(base*100);paint();
+    try{await addPdf(x.f,(t,fr)=>{UP.sub=t+' — '+x.f.name;UP.pct=Math.round((base+span*fr)*100);paint()});x.st='done';ok++}
+    catch(e){x.st=/비밀번호/.test(e.message)?'skip':'err';x.note=e.message;bad++}
+    if(view=='home')await render();
+  }
+  UP.busy=false;UP.pct=100;UP.msg=`✅ 완료: ${ok}개 성공${bad?` · ${bad}개 실패/건너뜀`:''}`;UP.sub=ok?'아래 "내 자료"에서 확인하세요':'';
+  if(view=='home')await render();else toast(UP.msg);
+}
+function paint(){
+  const b=$('#stbox');if(!b)return;
+  if(!UP.files.length&&!UP.busy&&!UP.msg){b.innerHTML='';return}
+  const ic={wait:'🕓',run:'⏳',done:'✅',err:'❌',skip:'🔒'},w=UP.files.filter(x=>x.st=='wait').length;
+  b.innerHTML=`<div class="card" style="border:2px solid var(--pri)">
+  ${UP.msg?`<div style="font-size:18px;font-weight:700">${UP.busy?'⏳ ':''}${esc(UP.msg)}</div><div style="margin:4px 0;word-break:break-all">${esc(UP.sub)}</div>`:''}
+  ${UP.busy?`<div style="height:12px;border-radius:99px;background:var(--bd);overflow:hidden"><div style="height:100%;width:${UP.pct}%;background:var(--pri);transition:width .3s"></div></div><div class="sub" style="margin-top:4px">${UP.pct}% · 분석이 끝날 때까지 화면을 켜 두세요</div>`:''}
+  <div style="margin-top:8px">${UP.files.map((x,k)=>`<div class="row" style="flex-wrap:nowrap;margin:4px 0"><span style="flex:4;word-break:break-all">${ic[x.st]} ${esc(x.f.name)} <span class="sub">${(x.f.size/1048576).toFixed(1)}MB${x.note?' · '+esc(x.note):''}</span></span>${!UP.busy&&x.st!='done'?`<button data-rm="${k}" style="flex:0">✕</button>`:''}</div>`).join('')}</div>
+  ${!UP.busy&&w?`<button class="p" id="goup" style="width:100%;margin-top:8px">▶ 업로드·AI 분석 시작 (${w}개)</button>`:''}</div>`;
+  b.querySelectorAll('[data-rm]').forEach(x=>x.onclick=()=>{UP.files.splice(+x.dataset.rm,1);paint()});
+  const g=$('#goup');if(g)g.onclick=runUp;
 }
 async function addImg(f){
-  $('#prog').textContent='사진 인식 중…';
-  const [t]=await ocr([await b64(f)]);
-  await putMat({id:Date.now()+'',name:'사진 '+new Date().toLocaleString('ko-KR'),size:f.size,pages:[t]});
+  if(UP.busy)return toast('다른 업로드가 끝난 뒤에 해 주세요');
+  UP.busy=true;UP.msg='사진 인식 중';UP.sub='AI가 사진 속 글자를 읽고 있어요';UP.pct=50;paint();
+  try{const [t]=await ocr([await b64(f)]);
+    await putMat({id:Date.now()+'',name:'사진 '+new Date().toLocaleString('ko-KR'),size:f.size,pages:[t]});
+    UP.msg='✅ 사진 저장 완료';UP.sub='';
+  }catch(e){UP.msg='❌ 사진 인식 실패';UP.sub=e.message}
+  UP.busy=false;if(view=='home')await render();
 }
 // ---------- 화면 ----------
 let view='home',cur={};
@@ -108,20 +169,21 @@ const bar=()=>`<nav class="card" style="padding:8px">${[['home','🏠','홈'],['
 async function render(){
   const v=$('#v');
   const H={home,mat,cards,quiz,notes,set}[view];
-  v.innerHTML=await H()+(view=='set'?'':bar());
+  try{v.innerHTML=await H()+(view=='set'?'':bar())}catch(e){v.innerHTML='<div class="card no">화면 오류: '+esc(e.message)+'</div>'+bar()}
   v.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));
   window.after&&window.after();window.after=null;
 }
 async function home(){
   const m=await mats(),hard=S.cards.filter(c=>c.st&&c.st!='know').length;
   window.after=()=>{
-    $('#pdf').onchange=async e=>{for(const f of e.target.files){try{await addPdf(f)}catch(x){toast(f.name+': '+x.message)}}go('home')};
-    $('#img').onchange=async e=>{try{await addImg(e.target.files[0])}catch(x){toast(x.message)}go('home')};
+    $('#pdf').onchange=e=>{addFiles([...e.target.files]);e.target.value=''};
+    $('#img').onchange=e=>{const f=e.target.files[0];e.target.value='';f&&addImg(f)};
+    paint();
     document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{if(confirm('삭제할까요?')){await delMat(b.dataset.del);go('home')}});
   };
   return `<div class="card"><b>학습 자료 올리기</b><p class="sub">PDF(1개당 50MB까지, 스캔본도 AI가 인식)와 사진은 이 기기에만 저장돼요.</p>
-  <div class="row"><label class="btn p" style="text-align:center">📄 PDF 선택<input id="pdf" type="file" accept="application/pdf" multiple hidden></label>
-  <label class="btn" style="text-align:center">📷 사진 찍기<input id="img" type="file" accept="image/*" capture="environment" hidden></label></div><div id="prog" class="sub"></div></div>
+  <div class="row"><label class="btn p" style="text-align:center">📄 PDF 선택 (여러 개)<input id="pdf" type="file" accept="application/pdf" multiple hidden></label>
+  <label class="btn" style="text-align:center">📷 사진 찍기<input id="img" type="file" accept="image/*" capture="environment" hidden></label></div></div><div id="stbox"></div>
   <h2>내 자료 (${m.length})</h2>${m.map(x=>`<div class="card row"><div style="flex:3"><b>${esc(x.name)}</b><div class="sub">${x.pages.length}쪽 · ${(x.size/1048576).toFixed(1)}MB</div></div><button data-del="${x.id}" style="flex:0">🗑</button></div>`).join('')||'<p class="sub">아직 자료가 없어요.</p>'}
   <div class="row"><button class="p" data-go="mat">✨ 카드·문제 만들기</button></div>
   <div class="card">카드 ${S.cards.length}개 · 문제 ${S.qs.length}개 · 오답 ${S.notes.length}개<br><span class="sub">복습할 카드 ${hard}개</span></div>`;
@@ -140,57 +202,98 @@ async function gen(){
   if(!ids.length)return toast('자료를 하나 이상 선택하세요');
   const n=Math.min(50,+$('#n').value||10),kind=$('#kind').value,ty=$('#ty').value;
   const all=(await mats()).filter(x=>ids.includes(x.id));
-  let ctx=all.map(x=>x.pages.map((p,i)=>`[${x.name} p.${i+1}]\n${p}`).join('\n')).join('\n\n').slice(0,400000);
+  let ctx=all.map(x=>x.pages.map((p,i)=>`[${x.name} p.${i+1}]\n${p}`).join('\n')).join('\n\n');if(ctx.length>400000){toast('자료가 길어 앞부분 일부만 사용했어요. 자료를 나눠 선택해 보세요');ctx=ctx.slice(0,400000)}
   const tyT={mix:'암기형(용어·수치·기준)과 서술형을 절반씩',mem:'암기형(용어·수치·기준) 위주로',ess:'개념 설명·이유를 쓰는 서술형 위주로'}[ty];
   const fmt=kind=='c'?'[{"q":"앞면(질문/용어)","a":"뒷면(답)","src":"파일명 p.쪽"}]':'[{"q":"문제","keywords":["채점 핵심 키워드"],"model":"모범 답안","src":"파일명 p.쪽"}]';
   $('#st').textContent='AI가 만드는 중…';$('#gen').disabled=true;
   try{
     const r=await gem([{text:`당신은 영양교사 임용시험 출제자입니다. 아래 자료에 있는 내용으로만 ${tyT} ${n}개의 ${kind=='c'?'플래시카드':'문제'}를 만드세요. 자료에 없는 내용은 절대 쓰지 마세요. JSON 배열로만 답하세요: ${fmt}\n\n자료:\n${ctx}`}]);
-    const arr=(Array.isArray(r)?r:[]).map(x=>({...x,id:Date.now()+Math.random()}));
+    const list=Array.isArray(r)?r:(Object.values(r||{}).find(Array.isArray)||[]);
+    const arr=list.filter(x=>x&&x.q&&(kind=='q'||x.a)).map((x,k)=>({...x,id:Date.now()+k+Math.random()}));
+    if(!arr.length)throw new Error('AI가 항목을 만들지 못했어요. 다시 시도해 주세요');
     if(kind=='c')S.cards.push(...arr);else S.qs.push(...arr);save();
     toast(arr.length+'개 만들었어요');go(kind=='c'?'cards':'quiz');
   }catch(e){toast(e.message);$('#st').textContent='';$('#gen').disabled=false}
 }
 async function cards(){
-  const pool=cur.rev?S.cards.filter(c=>c.st&&c.st!='know'):S.cards;
-  if(!pool.length)return `<div class="card">${cur.rev?'복습할 카드가 없어요.':'카드가 없어요. 먼저 만들어 주세요.'}</div><button class="p" data-go="mat">카드 만들기</button>`;
-  const i=(cur.i||0)%pool.length,c=pool[i];
+  if(!S.cards.length)return `<div class="card">카드가 없어요. 먼저 만들어 주세요.</div><button class="p" data-go="mat">카드 만들기</button>`;
+  if(!cur.q){const m=cur.mode||'new';cur.mode=m;cur.q=S.cards.filter(c=>m=='all'||(m=='rev'?(c.st=='no'||c.st=='mid'):c.st!='know')).map(c=>c.id);cur.i=0;cur.f=0}
+  const byId=id=>S.cards.find(x=>x.id==id);
+  if(!cur.q.length)return `<div class="card">${cur.mode=='rev'?'복습할 카드가 없어요 👍':'외우지 못한 카드가 없어요 🎉'}</div><div class="row"><button onclick="go('cards',{mode:'all'})">전체 카드 보기</button><button class="p" data-go="mat">새 카드 만들기</button></div>`;
+  if(cur.i>=cur.q.length){
+    const cs=cur.q.map(byId).filter(Boolean),n=k=>cs.filter(c=>c.st==k).length,hard=n('no')+n('mid');
+    return `<div class="card" style="text-align:center"><h2>🎉 ${cs.length}개 끝!</h2><p>알아요 <b class="ok">${n('know')}</b> · 헷갈려요 <b>${n('mid')}</b> · 몰라요 <b class="no">${n('no')}</b></p></div>
+    <div class="row">${hard?`<button class="p" onclick="go('cards',{mode:'rev'})">🔁 헷갈린 ${hard}개 복습</button>`:''}<button onclick="go('cards',{mode:'all'})">처음부터 다시</button></div>
+    <div class="row" style="margin-top:8px"><button data-go="mat">✨ 새 카드 만들기</button></div>`;
+  }
+  const i=cur.i,c=byId(cur.q[i]);
+  if(!c){cur.i=i+1;return cards()}
   window.after=()=>{
     $('#fl').onclick=()=>{cur.f=!cur.f;render()};
     $('#mic').onclick=e=>mic(e.target,$('#ans'));
-    $('#rv').onclick=()=>{cur.rev=!cur.rev;cur.i=0;cur.f=0;render()};
-    $('#del').onclick=()=>{if(confirm('이 카드를 삭제할까요?')){S.cards=S.cards.filter(x=>x.id!=c.id);save();cur.f=0;render()}};
+    $('#sp').onclick=()=>speak(c.q);
+    $('#del').onclick=()=>{if(confirm('이 카드를 삭제할까요?')){S.cards=S.cards.filter(x=>x.id!=c.id);cur.q.splice(i,1);cur.f=0;save();render()}};
     document.querySelectorAll('[data-st]').forEach(b=>b.onclick=()=>{c.st=b.dataset.st;save();cur.i=i+1;cur.f=0;render()});
   };
-  return `<div class="row"><span class="sub">${i+1} / ${pool.length}</span><button id="rv" style="flex:0">${cur.rev?'전체':'🔁 복습만'}</button><button id="del" style="flex:0">🗑</button></div>
+  return `<div class="row"><span class="sub">${i+1} / ${cur.q.length} · ${({new:'외울 카드',rev:'복습',all:'전체'})[cur.mode]}</span><button id="del" style="flex:0">🗑</button></div>
   <div class="card flip" id="fl"><div>${cur.f?`<b class="ok">${esc(c.a)}</b>`:esc(c.q)}<div class="tag" style="margin-top:12px">${esc(c.src)} · 탭하면 뒤집혀요</div></div></div>
   <textarea id="ans" placeholder="내 답 (말하면 글자로 표시돼요)" style="min-height:70px"></textarea>
-  <div class="row" style="margin:8px 0"><button id="mic">🎤 말하기</button><button onclick="speak(${JSON.stringify(c.q).replace(/"/g,'&quot;')})">🔊 읽어주기</button></div>
+  <div class="row" style="margin:8px 0"><button id="mic">🎤 말하기</button><button id="sp">🔊 읽어주기</button></div>
   <div class="row"><button data-st="no" class="no">몰라요</button><button data-st="mid">헷갈려요</button><button data-st="know" class="ok">알아요</button></div>`;
 }
+function saveNote(r){if(r.saved)return;r.saved=1;S.notes.push({q:r.q,a:r.a,model:r.model,miss:r.fb.miss,src:r.src,t:Date.now()});save()}
 async function quiz(){
-  if(!S.qs.length)return `<div class="card">문제가 없어요. 먼저 만들어 주세요.</div><button class="p" data-go="mat">문제 만들기</button>`;
-  const i=(cur.i||0)%S.qs.length,q=S.qs[i];
+  if(!S.qs.length&&!cur.ans&&!cur.res)return `<div class="card">문제가 없어요. 먼저 만들어 주세요.</div><button class="p" data-go="mat">문제 만들기</button>`;
+  const i=cur.i||0,ans=cur.ans||[];
+  // ----- 3) 결과: 문제별 내 답안 + AI 피드백 -----
+  if(cur.res){
+    const rs=cur.res,avg=Math.round(rs.reduce((t,r)=>t+(Number(r.fb.score)||0),0)/rs.length);
+    window.after=()=>{
+      document.querySelectorAll('[data-sv]').forEach(b=>b.onclick=()=>{saveNote(rs[+b.dataset.sv]);render()});
+      $('#svall').onclick=()=>{let n=0;rs.forEach(r=>{if((Number(r.fb.score)||0)<70&&!r.saved){saveNote(r);n++}});toast(n+'개를 오답노트에 저장했어요');render()};
+    };
+    return `<div class="card" style="text-align:center"><h2>📊 채점 결과</h2><p>${rs.length}문제 · 평균 <b>${avg}점</b></p><button id="svall">70점 미만 문제를 오답노트에 저장</button></div>
+    ${rs.map((r,k)=>{const f=r.fb;return `<div class="card"><div class="tag">${k+1}번 · ${esc(r.src)}</div><b>${esc(r.q)}</b>
+    <p><b>내 답안</b><br>${esc(r.a)||'<span class="sub">(답하지 않음)</span>'}</p>
+    <p><b>${esc(f.score)}점</b></p><p>✅ ${(f.hit||[]).map(x=>`<span class="chip">${esc(x)}</span>`).join('')||'-'}</p><p>❌ ${(f.miss||[]).map(x=>`<span class="chip no">${esc(x)}</span>`).join('')||'-'}</p>
+    <p><b>잘한 점</b> ${esc(f.good)}</p><p><b>보완할 점</b> ${esc(f.improve)}</p><p><b>모범 답안</b><br>${esc(r.model)}</p>
+    <button data-sv="${k}" ${r.saved?'disabled':''}>${r.saved?'저장됨':'📒 오답노트 저장'}</button></div>`}).join('')}
+    <div class="row"><button class="p" onclick="S.sess=[];save();go('quiz')">처음부터 다시</button><button data-go="mat">✨ 새 문제 만들기</button></div>`;
+  }
+  // ----- 2) 전부 제출 후: AI 채점 한 번에 -----
+  if(i>=S.qs.length){
+    window.after=()=>{$('#gr').onclick=async()=>{
+      const b=$('#gr'),er=$('#err');er.textContent='';b.disabled=true;b.textContent='AI가 채점하는 중… (잠시만요)';
+      try{
+        const items=ans.map((x,k)=>({n:k+1,문제:x.q,핵심키워드:x.keywords||[],모범답안:x.model,학생답안:x.a||'(답하지 않음)'}));
+        const r=await gem([{text:`영양교사 시험 채점관으로서 아래 ${ans.length}개 문제의 학생 답안을 각각 채점하세요. 답하지 않은 문제는 0점입니다. 한국어 JSON 배열로만, 입력과 같은 순서·개수로 답하세요: [{"n":번호,"score":0~100,"hit":["포함된 키워드"],"miss":["빠진 키워드·한계기준 등"],"good":"잘한 점","improve":"보완할 점"}]\n\n${JSON.stringify(items)}`}]);
+        const list=Array.isArray(r)?r:(Object.values(r||{}).find(Array.isArray)||[]);
+        cur.res=ans.map((x,k)=>({...x,fb:list.find(y=>y&&y.n==k+1)||list[k]||{score:0,hit:[],miss:[],good:'',improve:'채점 결과를 받지 못했어요'}}));
+        S.sess=[];save();render();
+      }catch(e){
+        er.textContent=e.message+(/credit|prepay|billing|quota/i.test(e.message)?'\n→ Google AI Studio에서 결제 크레딧을 충전한 뒤 다시 눌러 주세요. 답안은 저장돼 있어요.':'\n답안은 저장돼 있어요. 잠시 뒤 다시 눌러 주세요.');
+        b.disabled=false;b.textContent='🤖 AI 채점 받기';
+      }};};
+    return `<div class="card" style="text-align:center"><h2>✅ 답안 ${ans.length}개 제출 완료</h2><p class="sub">AI가 모든 문제를 한 번에 채점하고, 문제별 피드백을 내 답안과 함께 보여줘요.</p><button class="p" id="gr" style="width:100%">🤖 AI 채점 받기</button><div id="err" class="no" style="margin-top:8px;font-size:14px;white-space:pre-wrap"></div></div>
+    <div class="row"><button onclick="S.sess=[];save();go('quiz')">처음부터 다시</button><button data-go="home">홈으로</button></div>`;
+  }
+  // ----- 1) 문제 풀기: 제출하면 바로 다음 문제 -----
+  const q=S.qs[i],pend=(!cur.ans&&i==0&&S.sess&&S.sess.length)?S.sess.length:0;
   window.after=()=>{
     $('#mic').onclick=e=>mic(e.target,$('#ans'));
-    $('#nx')&&($('#nx').onclick=()=>go('quiz',{i:i+1}));
-    $('#del').onclick=()=>{if(confirm('이 문제를 삭제할까요?')){S.qs.splice(i,1);save();go('quiz',{i:0})}};
-    $('#sub').onclick=async()=>{
-      const a=$('#ans').value.trim();if(!a)return toast('답안을 입력하세요');
-      $('#sub').disabled=true;$('#sub').textContent='채점 중…';
-      try{const f=await gem([{text:`영양교사 시험 채점관으로서 답안을 채점하세요. 문제: ${q.q}\n핵심 키워드: ${(q.keywords||[]).join(', ')}\n모범 답안: ${q.model}\n학생 답안: ${a}\n한국어 JSON으로만: {"score":0~100,"hit":["포함된 키워드"],"miss":["빠진 키워드·한계기준 등"],"good":"잘한 점","improve":"보완할 점"}`}]);
-        cur.fb=f;cur.a=a;render();
-      }catch(e){toast(e.message);$('#sub').disabled=false;$('#sub').textContent='제출'}
-    };
-    if($('#sv'))$('#sv').onclick=()=>{S.notes.push({q:q.q,a:cur.a,model:q.model,miss:cur.fb.miss,src:q.src,t:Date.now()});save();toast('오답노트에 저장했어요');$('#sv').disabled=true};
+    $('#sp').onclick=()=>speak(q.q);
+    const next=a=>{const na=[...ans,{id:q.id,q:q.q,src:q.src,model:q.model,keywords:q.keywords,a}];S.sess=na;save();go('quiz',{i:i+1,ans:na})};
+    $('#sub').onclick=()=>{const a=$('#ans').value.trim();if(!a)return toast('답안을 쓰거나 건너뛰기를 눌러 주세요');next(a)};
+    $('#sk').onclick=()=>next('');
+    $('#del').onclick=()=>{if(confirm('이 문제를 삭제할까요?')){S.qs.splice(i,1);save();go('quiz',{i,ans})}};
+    $('#rs')&&($('#rs').onclick=()=>go('quiz',{i:S.qs.length,ans:S.sess}));
   };
-  const f=cur.fb;
-  return `<div class="row"><span class="sub">${i+1} / ${S.qs.length}</span><button id="del" style="flex:0">🗑</button></div>
-  <div class="card"><b>${esc(q.q)}</b><div class="tag">${esc(q.src)}</div><button onclick="speak(${JSON.stringify(q.q).replace(/"/g,'&quot;')})" style="margin-top:8px">🔊 문제 읽기</button></div>
-  <textarea id="ans" placeholder="답안 (🎤로 말하면 인식된 글자가 여기에 표시돼요)">${esc(cur.a||'')}</textarea>
-  <div class="row" style="margin:8px 0"><button id="mic">🎤 말하기</button><button class="p" id="sub">제출</button></div>
-  ${f?`<div class="card"><b>${f.score}점</b><p>✅ ${(f.hit||[]).map(k=>`<span class="chip">${esc(k)}</span>`).join('')||'-'}</p><p>❌ ${(f.miss||[]).map(k=>`<span class="chip no">${esc(k)}</span>`).join('')||'-'}</p><p><b>잘한 점</b> ${esc(f.good)}</p><p><b>보완할 점</b> ${esc(f.improve)}</p><p><b>모범 답안</b><br>${esc(q.model)}</p>
-  <div class="row"><button id="sv">📒 오답노트 저장</button><button id="nx" class="p">다음 문제</button></div></div>`:''}`;
+  return `${pend?`<div class="card">채점하지 못한 답안 ${pend}개가 있어요. <button id="rs" class="p" style="margin-top:6px;width:100%">그 답안 채점하러 가기</button></div>`:''}
+  <div class="row"><span class="sub">${i+1} / ${S.qs.length}</span><button id="del" style="flex:0">🗑</button></div>
+  <div class="card"><b>${esc(q.q)}</b><div class="tag">${esc(q.src)}</div><button id="sp" style="margin-top:8px">🔊 문제 읽기</button></div>
+  <textarea id="ans" placeholder="답안 (🎤로 말하면 인식된 글자가 여기에 표시돼요)"></textarea>
+  <div class="row" style="margin:8px 0"><button id="mic">🎤 말하기</button><button class="p" id="sub">제출 ›</button><button id="sk">건너뛰기</button></div>
+  <p class="sub">제출하면 다음 문제로 넘어가요. 마지막 문제 뒤에 AI가 한 번에 채점해요.</p>`;
 }
 async function notes(){
   window.after=()=>document.querySelectorAll('[data-nd]').forEach(b=>b.onclick=()=>{S.notes.splice(+b.dataset.nd,1);save();render()});
