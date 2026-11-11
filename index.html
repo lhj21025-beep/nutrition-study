@@ -48,10 +48,16 @@ const mats=()=>tx('readonly',s=>s.getAll()),putMat=m=>tx('readwrite',s=>s.put(m)
 // ---------- Gemini ----------
 async function gem(parts,json=true){
   if(!S.key)throw new Error('⚙️ 설정에서 Gemini 키를 먼저 입력하세요');
-  const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${S.model||DEF}:generateContent?key=${S.key}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contents:[{parts}],generationConfig:json?{responseMimeType:'application/json'}:{}})});
-  const j=await r.json();if(!r.ok)throw new Error(j.error?.message||r.status);
-  const t=(j.candidates?.[0]?.content?.parts||[]).map(p=>p.text||'').join('');
-  return json?JSON.parse(t.replace(/^```json|```$/g,'')):t;
+  const wait=ms=>new Promise(z=>setTimeout(z,ms));
+  for(let a=0;;a++){
+    let r,j;
+    try{r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${S.model||DEF}:generateContent?key=${S.key}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contents:[{parts}],generationConfig:json?{responseMimeType:'application/json'}:{}})});j=await r.json()}
+    catch(e){if(a<3){await wait(2000*(a+1));continue}throw new Error('네트워크 오류: '+e.message)}
+    if(!r.ok){const m=j.error?.message||String(r.status);if((r.status==429||r.status>=500)&&a<3&&!/credit|prepay|billing/i.test(m)){await wait(4000*(a+1));continue}throw new Error(m)}
+    const t=(j.candidates?.[0]?.content?.parts||[]).map(p=>p.text||'').join('');
+    if(!json)return t;
+    try{return JSON.parse(t.replace(/^```json|```$/g,''))}catch(e){if(a<2)continue;throw new Error('AI 응답을 읽지 못했어요. 다시 시도해 주세요')}
+  }
 }
 const b64=b=>new Promise(ok=>{const f=new FileReader();f.onload=()=>ok(f.result.split(',')[1]);f.readAsDataURL(b)});
 // ---------- 음성(Gemini 받아쓰기) ----------
@@ -70,13 +76,12 @@ async function mic(btn,out){
 const speak=t=>{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.lang='ko-KR';speechSynthesis.speak(u)};
 // ---------- PDF/이미지 ----------
 pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-async function ocr(imgs){ // imgs: base64 jpeg[]
+async function ocr(imgs){
+  const gs=[];for(let i=0;i<imgs.length;i+=4)gs.push(imgs.slice(i,i+4));
+  const one=async b=>{const r=await gem([{text:`이미지 ${b.length}장은 시험 공부 자료입니다. 각 이미지의 글자를 순서대로 그대로 옮겨 적어 길이 ${b.length}의 JSON 문자열 배열로만 답하세요.`},...b.map(d=>({inlineData:{mimeType:'image/jpeg',data:d}}))]);
+    const arr=Array.isArray(r)?r:(Object.values(r||{}).find(Array.isArray)||[]);return b.map((_,k)=>String(arr[k]??''))};
   const out=[];
-  for(let i=0;i<imgs.length;i+=4){
-    const b=imgs.slice(i,i+4);
-    const r=await gem([{text:`이미지 ${b.length}장은 시험 공부 자료입니다. 각 이미지의 글자를 순서대로 그대로 옮겨 적어 길이 ${b.length}의 JSON 문자열 배열로만 답하세요.`},...b.map(d=>({inlineData:{mimeType:'image/jpeg',data:d}}))]);
-    b.forEach((_,k)=>out.push(String(r[k]||'')));
-  }
+  for(let i=0;i<gs.length;i+=3)(await Promise.all(gs.slice(i,i+3).map(one))).forEach(x=>out.push(...x));
   return out;
 }
 const UP={files:[],busy:false,msg:'',sub:'',pct:0};
@@ -89,7 +94,12 @@ function askPw(name,wrong){return new Promise(ok=>{
   d.querySelector('#pwy').onclick=()=>end(i.value);d.querySelector('#pwn').onclick=()=>end(null);
   i.onkeydown=e=>{if(e.key=='Enter')end(i.value)};
 })}
-async function addPdf(f,report){
+function parseRange(t,N){
+  t=(t||'').trim().replace(/\s*[-~]\s*/g,'-');if(!t)return null;const st=new Set();
+  for(const part of t.split(/[,\s]+/)){const m=part.match(/^(\d+)(?:-(\d+))?$/);if(!m)continue;let a=+m[1],b=m[2]?+m[2]:a;if(a>b)[a,b]=[b,a];for(let n=Math.max(1,a);n<=Math.min(N,b);n++)st.add(n)}
+  if(!st.size)throw new Error('쪽 범위가 올바르지 않아요 (예: 1-50, 60)');return st;
+}
+async function addPdf(f,report,range){
   const task=pdfjsLib.getDocument({data:await f.arrayBuffer()});
   let cancelFn;const cancel=new Promise((_,no)=>cancelFn=no);
   task.onPassword=async(update,reason)=>{
@@ -98,16 +108,19 @@ async function addPdf(f,report){
   };
   const pdf=await Promise.race([task.promise,cancel]);
   try{
-    const N=pdf.numPages,pages=[];let buf=[],ns=0;
+    const N=pdf.numPages,want=parseRange(range,N),todo=[];
+    for(let n=1;n<=N;n++)if(!want||want.has(n))todo.push(n);
+    const pages=Array(N).fill('');let buf=[],ns=0;
     const flush=async fr=>{if(!buf.length)return;report(`🤖 AI가 스캔된 쪽을 글자로 인식 중 (스캔 ${ns}쪽째)`,fr);const r=await ocr(buf.map(b=>b[1]));buf.forEach((b,i)=>pages[b[0]]=r[i]);buf=[]};
-    for(let n=1;n<=N;n++){
-      report(`📖 글자 읽는 중 ${n}/${N}쪽`,n/N);
+    for(let k=0;k<todo.length;k++){
+      const n=todo[k],fr=(k+1)/todo.length;
+      report(`📖 ${n}쪽 읽는 중 (${k+1}/${todo.length})`,fr);
       const p=await pdf.getPage(n),t=(await p.getTextContent()).items.map(i=>i.str).join(' ').trim();
       if(t.length>=30)pages[n-1]=t;else{
         const vp=p.getViewport({scale:1.5}),c=document.createElement('canvas');c.width=vp.width;c.height=vp.height;
         await p.render({canvasContext:c.getContext('2d'),viewport:vp}).promise;
-        pages[n-1]='';ns++;buf.push([n-1,c.toDataURL('image/jpeg',.7).split(',')[1]]);c.width=c.height=0;
-        if(buf.length>=4)await flush(n/N);
+        ns++;buf.push([n-1,c.toDataURL('image/jpeg',.7).split(',')[1]]);c.width=c.height=0;
+        if(buf.length>=12)await flush(fr);
       }
       p.cleanup();
     }
@@ -122,7 +135,7 @@ function addFiles(fs){
     if(!/pdf$/i.test(f.type)&&!/\.pdf$/i.test(f.name))continue;
     if(f.size>MAX){toast(f.name+': 50MB를 넘어서 제외했어요');continue}
     if(UP.files.some(x=>x.f.name==f.name&&x.f.size==f.size))continue;
-    UP.files.push({f,st:'wait',note:''});
+    UP.files.push({f,st:'wait',note:'',range:''});
   }
   if(!UP.busy){UP.msg='';UP.sub=''}
   paint();
@@ -134,7 +147,7 @@ async function runUp(){
     const x=q[k];x.st='run';x.note='';
     const base=k/q.length,span=1/q.length;
     UP.msg=`파일 ${k+1}/${q.length} 분석 중`;UP.sub=x.f.name;UP.pct=Math.round(base*100);paint();
-    try{await addPdf(x.f,(t,fr)=>{UP.sub=t+' — '+x.f.name;UP.pct=Math.round((base+span*fr)*100);paint()});x.st='done';ok++}
+    try{await addPdf(x.f,(t,fr)=>{UP.sub=t+' — '+x.f.name;UP.pct=Math.round((base+span*fr)*100);paint()},x.range);x.st='done';ok++}
     catch(e){x.st=/비밀번호/.test(e.message)?'skip':'err';x.note=e.message;bad++}
     if(view=='home')await render();
   }
@@ -148,9 +161,10 @@ function paint(){
   b.innerHTML=`<div class="card" style="border:2px solid var(--pri)">
   ${UP.msg?`<div style="font-size:18px;font-weight:700">${UP.busy?'⏳ ':''}${esc(UP.msg)}</div><div style="margin:4px 0;word-break:break-all">${esc(UP.sub)}</div>`:''}
   ${UP.busy?`<div style="height:12px;border-radius:99px;background:var(--bd);overflow:hidden"><div style="height:100%;width:${UP.pct}%;background:var(--pri);transition:width .3s"></div></div><div class="sub" style="margin-top:4px">${UP.pct}% · 분석이 끝날 때까지 화면을 켜 두세요</div>`:''}
-  <div style="margin-top:8px">${UP.files.map((x,k)=>`<div class="row" style="flex-wrap:nowrap;margin:4px 0"><span style="flex:4;word-break:break-all">${ic[x.st]} ${esc(x.f.name)} <span class="sub">${(x.f.size/1048576).toFixed(1)}MB${x.note?' · '+esc(x.note):''}</span></span>${!UP.busy&&x.st!='done'?`<button data-rm="${k}" style="flex:0">✕</button>`:''}</div>`).join('')}</div>
+  <div style="margin-top:8px">${UP.files.map((x,k)=>`<div class="row" style="flex-wrap:nowrap;margin:4px 0"><span style="flex:4;word-break:break-all">${ic[x.st]} ${esc(x.f.name)} <span class="sub">${(x.f.size/1048576).toFixed(1)}MB${x.note?' · '+esc(x.note):''}</span></span>${!UP.busy&&x.st!='done'?`<button data-rm="${k}" style="flex:0">✕</button>`:''}</div>${x.st=='wait'?`<input data-rg="${k}" type="text" value="${esc(x.range)}" placeholder="분석할 쪽 범위 (예: 1-50, 60 · 비우면 전체)" style="margin-bottom:6px">`:''}`).join('')}</div>
   ${!UP.busy&&w?`<button class="p" id="goup" style="width:100%;margin-top:8px">▶ 업로드·AI 분석 시작 (${w}개)</button>`:''}</div>`;
   b.querySelectorAll('[data-rm]').forEach(x=>x.onclick=()=>{UP.files.splice(+x.dataset.rm,1);paint()});
+  b.querySelectorAll('[data-rg]').forEach(x=>x.oninput=()=>{UP.files[+x.dataset.rg].range=x.value});
   const g=$('#goup');if(g)g.onclick=runUp;
 }
 async function addImg(f){
@@ -184,14 +198,14 @@ async function home(){
   return `<div class="card"><b>학습 자료 올리기</b><p class="sub">PDF(1개당 50MB까지, 스캔본도 AI가 인식)와 사진은 이 기기에만 저장돼요.</p>
   <div class="row"><label class="btn p" style="text-align:center">📄 PDF 선택 (여러 개)<input id="pdf" type="file" accept="application/pdf" multiple hidden></label>
   <label class="btn" style="text-align:center">📷 사진 찍기<input id="img" type="file" accept="image/*" capture="environment" hidden></label></div></div><div id="stbox"></div>
-  <h2>내 자료 (${m.length})</h2>${m.map(x=>`<div class="card row"><div style="flex:3"><b>${esc(x.name)}</b><div class="sub">${x.pages.length}쪽 · ${(x.size/1048576).toFixed(1)}MB</div></div><button data-del="${x.id}" style="flex:0">🗑</button></div>`).join('')||'<p class="sub">아직 자료가 없어요.</p>'}
+  <h2>내 자료 (${m.length})</h2>${m.map(x=>`<div class="card row"><div style="flex:3"><b>${esc(x.name)}</b><div class="sub">분석 ${x.pages.filter(Boolean).length}/${x.pages.length}쪽 · ${(x.size/1048576).toFixed(1)}MB</div></div><button data-del="${x.id}" style="flex:0">🗑</button></div>`).join('')||'<p class="sub">아직 자료가 없어요.</p>'}
   <div class="row"><button class="p" data-go="mat">✨ 카드·문제 만들기</button></div>
   <div class="card">카드 ${S.cards.length}개 · 문제 ${S.qs.length}개 · 오답 ${S.notes.length}개<br><span class="sub">복습할 카드 ${hard}개</span></div>`;
 }
 async function mat(){
   const m=await mats();
   window.after=()=>{$('#gen').onclick=gen};
-  return `<h2>자료 선택 (여러 개 가능)</h2><div class="card">${m.map(x=>`<label style="display:block"><input type="checkbox" class="sel" value="${x.id}"> ${esc(x.name)} <span class="sub">${x.pages.length}쪽</span></label>`).join('')||'<span class="sub">홈에서 자료를 먼저 올려주세요.</span>'}</div>
+  return `<h2>자료 선택 (여러 개 가능)</h2><div class="card">${m.map(x=>`<label style="display:block"><input type="checkbox" class="sel" value="${x.id}"> ${esc(x.name)} <span class="sub">${x.pages.filter(Boolean).length}/${x.pages.length}쪽</span></label>`).join('')||'<span class="sub">홈에서 자료를 먼저 올려주세요.</span>'}</div>
   <div class="card"><div class="row"><div>종류<select id="kind"><option value="c">뒤집기 카드</option><option value="q">문제</option></select></div><div>개수<input id="n" type="number" min="1" max="50" value="10"></div></div>
   <div style="margin-top:8px">유형<select id="ty"><option value="mix">암기 + 서술 (반반)</option><option value="mem">암기 위주</option><option value="ess">서술 위주</option></select></div>
   <p class="sub">선택한 자료 안의 내용으로만 만들고, 각 항목에 파일명·쪽수를 표시해요.</p>
@@ -202,7 +216,7 @@ async function gen(){
   if(!ids.length)return toast('자료를 하나 이상 선택하세요');
   const n=Math.min(50,+$('#n').value||10),kind=$('#kind').value,ty=$('#ty').value;
   const all=(await mats()).filter(x=>ids.includes(x.id));
-  let ctx=all.map(x=>x.pages.map((p,i)=>`[${x.name} p.${i+1}]\n${p}`).join('\n')).join('\n\n');if(ctx.length>400000){toast('자료가 길어 앞부분 일부만 사용했어요. 자료를 나눠 선택해 보세요');ctx=ctx.slice(0,400000)}
+  let ctx=all.map(x=>x.pages.map((p,i)=>p?`[${x.name} p.${i+1}]\n${p}`:'').filter(Boolean).join('\n')).join('\n\n');if(ctx.length>400000){toast('자료가 길어 앞부분 일부만 사용했어요. 자료를 나눠 선택해 보세요');ctx=ctx.slice(0,400000)}
   const tyT={mix:'암기형(용어·수치·기준)과 서술형을 절반씩',mem:'암기형(용어·수치·기준) 위주로',ess:'개념 설명·이유를 쓰는 서술형 위주로'}[ty];
   const fmt=kind=='c'?'[{"q":"앞면(질문/용어)","a":"뒷면(답)","src":"파일명 p.쪽"}]':'[{"q":"문제","keywords":["채점 핵심 키워드"],"model":"모범 답안","src":"파일명 p.쪽"}]';
   $('#st').textContent='AI가 만드는 중…';$('#gen').disabled=true;
